@@ -1,97 +1,123 @@
--- MULTI-OBBY MOVEMENT ASSISTANT (Delta/mobile fixed)
--- Small mobile toggle + character alignment
--- Geometry scanning + landing estimates + jump guidance
--- For an obby you own or are authorized to test.
+
+-- Adaptive Obby Runner
+-- Roblox Studio prototype for an obby you control.
+-- Place in StarterPlayer > StarterPlayerScripts.
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local Workspace = game:GetService("Workspace")
 
 local player = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
 
---==================================================
--- SETTINGS
---==================================================
-
-local SCAN_RADIUS = 45
-local SCAN_INTERVAL = 0.40
-local MAX_CANDIDATES = 8
-local ARRIVAL_DISTANCE = 4.5
-
-local JUMP_SPEED = 50
-local GRAVITY = Workspace.Gravity
-
---==================================================
--- STATE
---==================================================
+local CONFIG = {
+    ScanRadius = 35,
+    ScanInterval = 0.35,
+    ArrivalDistance = 4,
+    MaxJumpHeight = 12,
+    MaxHorizontalJump = 15,
+    FallY = -30,
+    LearningAlpha = 0.25,
+}
 
 local enabled = false
-local alignCharacter = true
 local character, humanoid, root
-local candidates = {}
-local target = nil
+local target
 local lastScan = 0
+local jumpStartedAt = 0
+local wasAirborne = false
+local lastPosition
+local lastTargetKey
+local lastJumpOutcome = "Ready"
 
---==================================================
--- MOBILE UI (fixed parenting)
---==================================================
+-- Learning memory persists during this LocalScript's lifetime.
+-- Success increases preference for a route; failure reduces it.
+local memory = {}
 
-task.wait(0.5)
-
-local gui = Instance.new("ScreenGui")
-gui.Name = "MultiObbyAssistant"
-gui.ResetOnSpawn = false
-gui.IgnoreGuiInset = true
-gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-gui.DisplayOrder = 999
-
-local parented = pcall(function()
-    gui.Parent = player:WaitForChild("PlayerGui", 10)
-end)
-
-if not parented or not gui.Parent then
-    gui.Parent = game:GetService("CoreGui")
+local function getKey(part)
+    return part:GetFullName()
 end
 
--- Toggle button
+local function learn(key, success)
+    local entry = memory[key]
+
+    if not entry then
+        entry = {
+            attempts = 0,
+            successes = 0,
+            score = 0.5,
+        }
+        memory[key] = entry
+    end
+
+    entry.attempts += 1
+
+    if success then
+        entry.successes += 1
+    end
+
+    local outcome = success and 1 or 0
+
+    entry.score =
+        entry.score * (1 - CONFIG.LearningAlpha)
+        + outcome * CONFIG.LearningAlpha
+
+    print(string.format(
+        "[Runner] Learned %s: %d/%d successes, score %.2f",
+        key,
+        entry.successes,
+        entry.attempts,
+        entry.score
+    ))
+end
+
+--==================================================
+-- GUI
+--==================================================
+
+local oldGui = playerGui:FindFirstChild("AdaptiveObbyRunner")
+if oldGui then
+    oldGui:Destroy()
+end
+
+local gui = Instance.new("ScreenGui")
+gui.Name = "AdaptiveObbyRunner"
+gui.ResetOnSpawn = false
+gui.DisplayOrder = 100
+gui.Parent = playerGui
+
 local button = Instance.new("TextButton")
 button.Name = "Toggle"
-button.Size = UDim2.fromOffset(60, 60)
-button.Position = UDim2.new(1, -80, 0.55, 0)
-button.BackgroundColor3 = Color3.fromRGB(145, 55, 55)
+button.Size = UDim2.fromOffset(64, 64)
+button.Position = UDim2.new(1, -84, 0.55, -32)
+button.BackgroundColor3 = Color3.fromRGB(170, 55, 55)
 button.TextColor3 = Color3.new(1, 1, 1)
-button.Text = "OB"
+button.Font = Enum.Font.GothamBold
 button.TextScaled = true
-button.AutoButtonColor = true
+button.Text = "OFF"
 button.Active = true
 button.Parent = gui
 
-local round = Instance.new("UICorner")
-round.CornerRadius = UDim.new(1, 0)
-round.Parent = button
+local corner = Instance.new("UICorner")
+corner.CornerRadius = UDim.new(1, 0)
+corner.Parent = button
 
-local outline = Instance.new("UIStroke")
-outline.Thickness = 2
-outline.Color = Color3.new(1, 1, 1)
-outline.Parent = button
-
--- Status label
 local status = Instance.new("TextLabel")
-status.Size = UDim2.new(0, 220, 0, 70)
-status.Position = UDim2.new(1, -235, 0.55, 70)
+status.Name = "Status"
+status.Size = UDim2.fromOffset(225, 65)
+status.Position = UDim2.new(1, -240, 0.55, 38)
 status.BackgroundColor3 = Color3.fromRGB(25, 27, 35)
 status.BackgroundTransparency = 0.1
 status.TextColor3 = Color3.new(1, 1, 1)
 status.TextWrapped = true
 status.TextScaled = true
-status.Text = "Assistant OFF"
+status.Font = Enum.Font.Gotham
+status.Text = "Runner stopped"
 status.Parent = gui
 
-local statusRound = Instance.new("UICorner")
-statusRound.CornerRadius = UDim.new(0, 8)
-statusRound.Parent = status
-
-print("[ObbyAssist] GUI parented to:", gui.Parent)
+local statusCorner = Instance.new("UICorner")
+statusCorner.CornerRadius = UDim.new(0, 8)
+statusCorner.Parent = status
 
 --==================================================
 -- CHARACTER
@@ -101,8 +127,13 @@ local function bindCharacter(char)
     character = char
     humanoid = char:WaitForChild("Humanoid")
     root = char:WaitForChild("HumanoidRootPart")
+
     target = nil
-    print("[ObbyAssist] Character bound")
+    lastTargetKey = nil
+    wasAirborne = false
+    lastPosition = root.Position
+
+    print("[Runner] Character ready")
 end
 
 if player.Character then
@@ -112,11 +143,11 @@ end
 player.CharacterAdded:Connect(bindCharacter)
 
 --==================================================
--- GEOMETRY SCANNER
+-- PLATFORM SCANNING
 --==================================================
 
 local function scanPlatforms()
-    if not root or not character then
+    if not character or not root or not humanoid then
         return {}
     end
 
@@ -126,11 +157,11 @@ local function scanPlatforms()
 
     local parts = Workspace:GetPartBoundsInRadius(
         root.Position,
-        SCAN_RADIUS,
+        CONFIG.ScanRadius,
         params
     )
 
-    local found = {}
+    local results = {}
 
     for _, part in ipairs(parts) do
         if part:IsA("BasePart")
@@ -139,192 +170,142 @@ local function scanPlatforms()
             and part.Size.X >= 2
             and part.Size.Z >= 2 then
 
-            local topY = part.Position.Y + part.Size.Y / 2
+            local landingY =
+                part.Position.Y
+                + part.Size.Y / 2
+                + humanoid.HipHeight
+                + root.Size.Y / 2
 
             local landing = Vector3.new(
                 part.Position.X,
-                topY + humanoid.HipHeight + root.Size.Y / 2,
+                landingY,
                 part.Position.Z
             )
 
             local delta = landing - root.Position
-            local horizontal = Vector3.new(delta.X, 0, delta.Z).Magnitude
-            local vertical = delta.Y
-            local distance = delta.Magnitude
+            local horizontal = Vector3.new(
+                delta.X, 0, delta.Z
+            ).Magnitude
 
-            if distance > ARRIVAL_DISTANCE
-                and vertical > -25
-                and vertical < 20 then
+            local height = delta.Y
 
-                table.insert(found, {
+            if horizontal > CONFIG.ArrivalDistance
+                and horizontal <= CONFIG.MaxHorizontalJump
+                and height > -8
+                and height <= CONFIG.MaxJumpHeight then
+
+                local key = getKey(part)
+                local entry = memory[key]
+                local learnedScore = entry and entry.score or 0.5
+
+                -- Lower is better. Learned successful routes
+                -- receive a modest preference.
+                local score =
+                    horizontal
+                    + math.abs(height) * 1.4
+                    + (1 - learnedScore) * 4
+
+                table.insert(results, {
                     part = part,
                     position = landing,
-                    distance = distance,
                     horizontal = horizontal,
-                    height = vertical
+                    height = height,
+                    score = score,
+                    key = key,
                 })
             end
         end
     end
 
-    table.sort(found, function(a, b)
-        local scoreA = a.distance + math.abs(a.height) * 1.3
-        local scoreB = b.distance + math.abs(b.height) * 1.3
-        return scoreA < scoreB
+    table.sort(results, function(a, b)
+        return a.score < b.score
     end)
 
-    while #found > MAX_CANDIDATES do
-        table.remove(found)
+    return results
+end
+
+--==================================================
+-- TARGET VALIDATION
+--==================================================
+
+local function targetIsValid(item)
+    if not item or not item.part then
+        return false
     end
 
-    return found
-end
-
---==================================================
--- LANDING ESTIMATE (proper kinematic solve)
---==================================================
-
-local function estimateLanding(targetY)
-    if not root then return nil, nil end
-
-    local position = root.Position
-    local velocity = root.AssemblyLinearVelocity
-    local g = math.max(GRAVITY, 1)
-
-    local dy = (targetY or position.Y) - position.Y
-    local a = -0.5 * g
-    local b = velocity.Y
-    local c = -dy
-
-    local disc = b * b - 4 * a * c
-    if disc < 0 then return nil, nil end
-
-    local sqrtDisc = math.sqrt(disc)
-    local t1 = (-b + sqrtDisc) / (2 * a)
-    local t2 = (-b - sqrtDisc) / (2 * a)
-    local t = math.min(t1, t2)
-    if t < 0 then t = math.max(t1, t2) end
-    if t < 0 then return nil, nil end
-
-    t = math.clamp(t, 0.05, 2.0)
-
-    local predicted = Vector3.new(
-        position.X + velocity.X * t,
-        position.Y + velocity.Y * t - 0.5 * g * t * t,
-        position.Z + velocity.Z * t
-    )
-
-    return predicted, t
-end
-
---==================================================
--- LINE OF SIGHT (excludes target part)
---==================================================
-
-local function blocked(item)
-    if not root or not item then return true end
-
-    local params = RaycastParams.new()
-    params.FilterType = Enum.RaycastFilterType.Exclude
-    params.FilterDescendantsInstances = {character, item.part}
-
-    local origin = root.Position + Vector3.new(0, humanoid.HipHeight, 0)
-    local direction = item.position - origin
-
-    return Workspace:Raycast(origin, direction, params) ~= nil
-end
-
-local function chooseTarget()
-    for _, item in ipairs(candidates) do
-        if item.part:IsDescendantOf(Workspace) and not blocked(item) then
-            return item
-        end
+    if not item.part:IsDescendantOf(Workspace) then
+        return false
     end
-    return candidates[1]
+
+    local delta = item.position - root.Position
+    local horizontal = Vector3.new(
+        delta.X, 0, delta.Z
+    ).Magnitude
+
+    return horizontal <= CONFIG.MaxHorizontalJump
+        and delta.Y <= CONFIG.MaxJumpHeight
+        and delta.Y > -8
 end
 
 --==================================================
--- CHARACTER-ONLY FACING
+-- MOVEMENT
 --==================================================
 
-local function alignFacing()
-    if not enabled or not alignCharacter or not root or not humanoid then
+local function moveToward(item)
+    if not humanoid or not root or not item then
         return
     end
 
-    local direction = humanoid.MoveDirection
+    local delta = item.position - root.Position
+    local flat = Vector3.new(delta.X, 0, delta.Z)
 
-    if direction.Magnitude > 0.15 then
-        local flat = Vector3.new(direction.X, 0, direction.Z)
-
-        if flat.Magnitude > 0.01 then
-            humanoid.AutoRotate = false
-
-            local desired = CFrame.lookAt(
-                root.Position,
-                root.Position + flat.Unit
-            )
-
-            root.CFrame = root.CFrame:Lerp(desired, 0.18)
-        end
-    else
-        humanoid.AutoRotate = true
-    end
-end
-
---==================================================
--- GUIDANCE
---==================================================
-
-local function updateStatus()
-    if not enabled then
-        status.Text = "Assistant OFF"
-        return
+    if flat.Magnitude > 0.1 then
+        humanoid:Move(flat.Unit, false)
     end
 
-    if not root or not humanoid then
-        status.Text = "Waiting for character..."
-        return
-    end
-
-    if not target then
-        status.Text = "No suitable platform found nearby."
-        return
-    end
-
-    local delta = target.position - root.Position
-    local horizontal = Vector3.new(delta.X, 0, delta.Z).Magnitude
-
-    local landing = estimateLanding(target.position.Y)
-    local advice
-
-    if humanoid.FloorMaterial == Enum.Material.Air then
-        advice = "AIRBORNE: prepare landing"
-    elseif delta.Y > 4 and horizontal < 16 then
-        advice = "UP: jump may be needed"
-    elseif horizontal > 18 then
-        advice = "FAR: inspect route"
-    elseif blocked(target) then
-        advice = "BLOCKED: try another route"
-    else
-        advice = "APPROACH: align movement"
-    end
-
-    local prediction = ""
-    if landing then
-        prediction = string.format(
-            "\nEst land: %.1f, %.1f",
-            landing.X, landing.Z
+    -- Face movement direction without rotating the camera.
+    if flat.Magnitude > 0.1 then
+        local desired = CFrame.lookAt(
+            root.Position,
+            root.Position + flat.Unit
         )
+
+        root.CFrame = root.CFrame:Lerp(desired, 0.12)
     end
 
-    status.Text = string.format(
-        "%s\nDist %.1f | Hgt %.1f%s",
-        advice,
-        horizontal,
-        delta.Y,
-        prediction
-    )
+    -- Jump when approaching a higher platform or an edge.
+    if humanoid.FloorMaterial ~= Enum.Material.Air then
+        if item.height > 2
+            or (item.horizontal < 7 and item.height > 0.5) then
+
+            humanoid.Jump = true
+            jumpStartedAt = os.clock()
+            wasAirborne = true
+        end
+    end
+end
+
+--==================================================
+-- FALL RECOVERY
+--==================================================
+
+local function handleFall()
+    if not root or not humanoid then
+        return
+    end
+
+    if root.Position.Y < CONFIG.FallY then
+        status.Text = "Fell! Waiting for respawn..."
+        target = nil
+
+        humanoid:Move(Vector3.zero, false)
+        return
+    end
+
+    if humanoid.Health <= 0 then
+        status.Text = "Respawning..."
+        target = nil
+    end
 end
 
 --==================================================
@@ -334,20 +315,20 @@ end
 button.Activated:Connect(function()
     enabled = not enabled
 
-    button.Text = enabled and "ON" or "OB"
+    button.Text = enabled and "ON" or "OFF"
     button.BackgroundColor3 = enabled
         and Color3.fromRGB(45, 175, 105)
-        or Color3.fromRGB(145, 55, 55)
+        or Color3.fromRGB(170, 55, 55)
 
-    if not enabled then
-        target = nil
-        if humanoid then
-            humanoid.AutoRotate = true
-        end
+    if not enabled and humanoid then
+        humanoid:Move(Vector3.zero, false)
+        humanoid.Jump = false
+        humanoid.AutoRotate = true
     end
 
-    updateStatus()
-    print("[ObbyAssist] Toggled:", enabled)
+    status.Text = enabled and "Runner starting..." or "Runner stopped"
+
+    print("[Runner] Enabled:", enabled)
 end)
 
 --==================================================
@@ -355,31 +336,77 @@ end)
 --==================================================
 
 RunService.Heartbeat:Connect(function()
-    if not enabled or not root or not humanoid then
+    if not enabled then
         return
     end
 
-    alignFacing()
+    if not character or not humanoid or not root
+        or humanoid.Health <= 0 then
+        status.Text = "Waiting for character..."
+        return
+    end
 
-    if os.clock() - lastScan >= SCAN_INTERVAL then
+    handleFall()
+
+    if root.Position.Y < CONFIG.FallY then
+        return
+    end
+
+    local airborne =
+        humanoid.FloorMaterial == Enum.Material.Air
+
+    if wasAirborne and not airborne and lastTargetKey then
+        -- Landing is considered successful if we remain
+        -- alive and reach the target's vicinity.
+        local success = false
+
+        if target and target.part
+            and target.part:IsDescendantOf(Workspace) then
+
+            local distance = (
+                root.Position - target.position
+            ).Magnitude
+
+            success = distance < 7
+        end
+
+        learn(lastTargetKey, success)
+        lastJumpOutcome = success and "Success" or "Missed"
+
+        wasAirborne = false
+    end
+
+    if os.clock() - lastScan >= CONFIG.ScanInterval then
         lastScan = os.clock()
 
-        candidates = scanPlatforms()
-
-        if target then
-            local distance = (target.position - root.Position).Magnitude
-            if distance < ARRIVAL_DISTANCE
-                or not target.part:IsDescendantOf(Workspace) then
-                target = nil
-            end
+        if target and not targetIsValid(target) then
+            target = nil
         end
 
         if not target then
-            target = chooseTarget()
-        end
+            local options = scanPlatforms()
+            target = options[1]
 
-        updateStatus()
+            if target then
+                lastTargetKey = target.key
+            end
+        end
     end
+
+    if target then
+        moveToward(target)
+
+        status.Text = string.format(
+            "RUNNING\nTarget: %.1f studs\nLast jump: %s",
+            target.horizontal,
+            lastJumpOutcome
+        )
+    else
+        humanoid:Move(Vector3.zero, false)
+        status.Text = "Searching for platform..."
+    end
+
+    lastPosition = root.Position
 end)
 
-print("[ObbyAssist] Multi-Obby Movement Assistant ready.")
+print("[Runner] Loaded. Tap OFF to start.")
