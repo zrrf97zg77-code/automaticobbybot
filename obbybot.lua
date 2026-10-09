@@ -1,328 +1,479 @@
---!strict
--- Obby Auto-Runner v5.1 — No shiftlock, no speed boost
--- Place in StarterPlayer/StarterPlayerScripts
+
+-- TOH ADAPTIVE BOT | DELTA MOBILE
+-- Session-based learning; no Studio required.
+-- Remove any previous bot before running.
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local Workspace = game:GetService("Workspace")
-local CollectionService = game:GetService("CollectionService")
 
 local player = Players.LocalPlayer
 local playerGui = player:WaitForChild("PlayerGui")
 
--- ===== CONFIG =====
-local SCAN_RANGE = 50
-local SCAN_HALF_ANGLE = 55
-local RAY_COUNT = 9
-local SCAN_INTERVAL = 0.12
-local EDGE_APPROACH_DIST = 3.5
-local JUMP_COOLDOWN = 0.18
-local STUCK_TIMEOUT = 1.5
-local STUCK_PROGRESS_THRESHOLD = 0.5
+-- SETTINGS
+local SCAN_RANGE = 38
+local SCAN_ANGLE = 80
+local SCAN_RAYS = 17
+local SCAN_INTERVAL = 0.08
+local JUMP_COOLDOWN = 0.24
+local MAX_TARGET_HEIGHT = 9
+local MAX_TARGET_DROP = 15
+local TARGET_REACHED = 4
+local MEMORY_RADIUS = 7
 
--- WALLHOP / LADDER
-local WALL_CHECK_DIST = 4.5
-local WALLHOP_ENABLED = true
-local WALLHOP_COOLDOWN = 0.45
-local LADDER_SPAM_INTERVAL = 0.12
-local LADDER_DETECT_DIST = 4
+-- STATE
+local enabled = false
+local humanoid = nil
+local root = nil
+local targetPosition = nil
+local targetPart = nil
+local moveDirection = Vector3.zero
+local jumpRequested = false
+local status = "BOT OFF"
+local lastJump = 0
+local scanTimer = 0
+local lastY = nil
+local lastGroundedPosition = nil
+local lastGroundedTime = 0
+local lastTargetKey = nil
+local fallStartY = nil
+local jumpAttempts = 0
+local progressTimer = 0
+local lastProgressPosition = nil
+local stuckTime = 0
 
--- ===== WHITELIST =====
-local WHITELIST_FOLDER_NAME = "Obby"
-local WHITELIST_TAG = "ObbyPlatform"
+-- Learning memory for this session.
+-- Memory entries are keyed by approximate world position.
+local memory = {}
 
-local function getWhitelistInstances(): {Instance}
-    local list = {}
-    if WHITELIST_FOLDER_NAME then
-        local folder = Workspace:FindFirstChild(WHITELIST_FOLDER_NAME)
-        if folder then table.insert(list, folder) end
-    end
-    if WHITELIST_TAG then
-        for _, obj in CollectionService:GetTagged(WHITELIST_TAG) do
-            table.insert(list, obj)
-        end
-    end
-    return list
+local function keyFor(pos)
+    return string.format(
+        "%d:%d:%d",
+        math.floor(pos.X / MEMORY_RADIUS + 0.5),
+        math.floor(pos.Y / MEMORY_RADIUS + 0.5),
+        math.floor(pos.Z / MEMORY_RADIUS + 0.5)
+    )
 end
 
--- ===== STATE =====
-local botEnabled = false
-local currentStatus = "BOT OFF"
-local humanoid: Humanoid? = nil
-local hrp: BasePart? = nil
+local function getMemory(pos)
+    local key = keyFor(pos)
+    if not memory[key] then
+        memory[key] = {
+            failures = 0,
+            successes = 0,
+            lastFailure = 0
+        }
+    end
+    return memory[key], key
+end
 
-local lastPos = Vector3.zero
-local lastProgressTime = 0
-local lastJumpTime = 0
-local lastWallhopTime = 0
-local lastLadderSpam = 0
-local currentTarget: BasePart? = nil
-local cachedMoveDir = Vector3.zero
-local cachedShouldJump = false
-local scanAccum = 0
+local function recordFailure()
+    if not lastTargetKey then return end
 
--- ===== RAYCAST (whitelist only) =====
+    local entry = memory[lastTargetKey]
+    if entry then
+        entry.failures = math.min(entry.failures + 1, 8)
+        entry.lastFailure = os.clock()
+    end
+
+    targetPosition = nil
+    targetPart = nil
+    jumpAttempts = jumpAttempts + 1
+    lastTargetKey = nil
+end
+
+local function recordSuccess()
+    if not lastTargetKey then return end
+
+    local entry = memory[lastTargetKey]
+    if entry then
+        entry.successes = math.min(entry.successes + 1, 20)
+        entry.failures = math.max(0, entry.failures - 1)
+    end
+
+    lastTargetKey = nil
+    jumpAttempts = 0
+end
+
+-- UI
+local old = playerGui:FindFirstChild("AdaptiveTOHBot")
+if old then old:Destroy() end
+
+local gui = Instance.new("ScreenGui")
+gui.Name = "AdaptiveTOHBot"
+gui.ResetOnSpawn = false
+gui.DisplayOrder = 999
+gui.Parent = playerGui
+
+local button = Instance.new("TextButton")
+button.Size = UDim2.fromOffset(112, 42)
+button.Position = UDim2.new(0, 14, 0.35, 0)
+button.BackgroundColor3 = Color3.fromRGB(55, 55, 65)
+button.TextColor3 = Color3.new(1, 1, 1)
+button.Text = "TOH BOT: OFF"
+button.TextSize = 13
+button.Font = Enum.Font.GothamBold
+button.Parent = gui
+
+local corner = Instance.new("UICorner")
+corner.CornerRadius = UDim.new(0, 9)
+corner.Parent = button
+
+local function updateButton()
+    button.Text = enabled and ("BOT: " .. status) or "TOH BOT: OFF"
+    button.BackgroundColor3 = enabled
+        and Color3.fromRGB(35, 135, 75)
+        or Color3.fromRGB(55, 55, 65)
+end
+
+-- Raycast configuration
 local rayParams = RaycastParams.new()
-rayParams.FilterType = Enum.RaycastFilterType.Include
+rayParams.FilterType = Enum.RaycastFilterType.Exclude
 rayParams.IgnoreWater = true
 rayParams.RespectCanCollide = true
 
--- ===== UI =====
-local screenGui = Instance.new("ScreenGui")
-screenGui.Name = "ObbyBotUI"
-screenGui.ResetOnSpawn = false
-screenGui.Parent = playerGui
+local function bindCharacter(char)
+    humanoid = char:WaitForChild("Humanoid", 8)
+    root = char:WaitForChild("HumanoidRootPart", 8)
 
-local toggleBtn = Instance.new("TextButton")
-toggleBtn.Size = UDim2.new(0, 80, 0, 40)
-toggleBtn.Position = UDim2.new(0, 12, 0, 12)
-toggleBtn.BackgroundColor3 = Color3.fromRGB(60, 60, 65)
-toggleBtn.TextColor3 = Color3.fromRGB(240, 240, 240)
-toggleBtn.TextSize = 13
-toggleBtn.Font = Enum.Font.GothamBold
-toggleBtn.Text = "BOT OFF"
-toggleBtn.AutoButtonColor = false
-toggleBtn.Parent = screenGui
-Instance.new("UICorner", toggleBtn).CornerRadius = UDim.new(0, 8)
+    rayParams.FilterDescendantsInstances = {char}
 
--- ===== CHARACTER BIND =====
-local function onCharacter(char: Model)
-    local h = char:WaitForChild("Humanoid", 5) :: Humanoid?
-    local r = char:WaitForChild("HumanoidRootPart", 5) :: BasePart?
-    if not h or not r then return end
-
-    humanoid = h
-    hrp = r
-    currentTarget = nil
-    lastPos = r.Position
-    lastProgressTime = tick()
-
-    -- make sure no leftover shiftlock state sticks around
-    h.AutoRotate = true
-    h.CameraOffset = Vector3.new(0, 0, 0)
-
-    local filter = getWhitelistInstances()
-    table.insert(filter, char)
-    rayParams.FilterDescendantsInstances = filter
+    targetPosition = nil
+    targetPart = nil
+    moveDirection = Vector3.zero
+    jumpRequested = false
+    lastTargetKey = nil
+    lastY = root and root.Position.Y or nil
+    lastGroundedPosition = nil
+    fallStartY = nil
+    stuckTime = 0
 end
 
-player.CharacterAdded:Connect(onCharacter)
-if player.Character then task.defer(onCharacter, player.Character) end
+player.CharacterAdded:Connect(bindCharacter)
+if player.Character then
+    task.spawn(bindCharacter, player.Character)
+end
 
--- ===== SCAN =====
-local function scanForPlatforms(origin: Vector3, facing: Vector3): BasePart?
-    local bestPart: BasePart? = nil
-    local bestScore = -math.huge
-    local fwd = Vector3.new(facing.X, 0, facing.Z).Unit
-    local right = Vector3.new(fwd.Z, 0, -fwd.X)
+-- Find a walkable surface below a point.
+local function groundAt(position, depth)
+    local result = Workspace:Raycast(
+        position,
+        Vector3.new(0, -depth, 0),
+        rayParams
+    )
 
-    for i = 0, RAY_COUNT - 1 do
-        local t = (i / (RAY_COUNT - 1)) * 2 - 1
-        local angleRad = math.rad(SCAN_HALF_ANGLE * t)
-        local dir = (fwd * math.cos(angleRad) + right * math.sin(angleRad)).Unit
-
-        local result = Workspace:Raycast(origin, dir * SCAN_RANGE, rayParams)
-        if not result then continue end
-        local part = result.Instance
-        if not part:IsA("BasePart") then continue end
-        if math.abs(result.Normal.Y) < 0.7 then continue end
-
-        local hitPos = result.Position
-        local dist = (hitPos - origin).Magnitude
-        local heightDiff = hitPos.Y - origin.Y
-        if heightDiff > 6 or heightDiff < -18 then continue end
-        if dist < 2.5 then continue end
-
-        local score = (SCAN_RANGE - dist) * 1.2
-        score -= math.abs(heightDiff - 2) * 0.5
-        score += (1 - math.abs(t)) * 4
-
-        if score > bestScore then
-            bestScore = score
-            bestPart = part
-        end
+    if result and result.Instance:IsA("BasePart")
+        and result.Instance.CanCollide
+        and result.Normal.Y > 0.7 then
+        return result
     end
-    return bestPart
-end
 
-local function hasGroundBelow(pos: Vector3, maxDepth: number): boolean
-    local result = Workspace:Raycast(pos, Vector3.new(0, -maxDepth, 0), rayParams)
-    return result ~= nil and result.Instance:IsA("BasePart")
-        and math.abs(result.Normal.Y) > 0.7
-end
-
-local function detectWall(pos: Vector3, facing: Vector3): Vector3?
-    local fwd = Vector3.new(facing.X, 0, facing.Z).Unit
-    local right = Vector3.new(fwd.Z, 0, -fwd.X)
-    for _, dir in { right, -right } do
-        local res = Workspace:Raycast(pos + Vector3.new(0, 1, 0), dir * WALL_CHECK_DIST, rayParams)
-        if res and res.Instance:IsA("BasePart")
-            and math.abs(res.Normal.Y) < 0.4 then
-            return dir
-        end
-    end
     return nil
 end
 
-local function detectLadder(pos: Vector3, facing: Vector3): boolean
-    local fwd = Vector3.new(facing.X, 0, facing.Z).Unit
-    local res = Workspace:Raycast(pos + Vector3.new(0, 1.5, 0), fwd * LADDER_DETECT_DIST, rayParams)
-    if not res then return false end
-    local p = res.Instance
-    if p:IsA("TrussPart") then return true end
-    local name = p.Name:lower()
-    return name:find("ladder") ~= nil or name:find("truss") ~= nil
+-- Find a platform in a forward fan.
+-- Returns the surface hit position, not the part's center.
+local function scanPlatforms()
+    if not root then return nil end
+
+    local origin = root.Position
+    local facing = Vector3.new(
+        root.CFrame.LookVector.X, 0, root.CFrame.LookVector.Z
+    )
+
+    if facing.Magnitude < 0.01 then
+        facing = Vector3.new(0, 0, -1)
+    else
+        facing = facing.Unit
+    end
+
+    local right = Vector3.new(-facing.Z, 0, facing.X)
+    local bestScore = -math.huge
+    local bestPosition = nil
+    local bestPart = nil
+    local bestKey = nil
+
+    -- Widen the scan after repeated failures.
+    local angleWidth = math.min(SCAN_ANGLE + jumpAttempts * 5, 115)
+
+    for i = 0, SCAN_RAYS - 1 do
+        local t = i / (SCAN_RAYS - 1)
+        local angle = math.rad(-angleWidth + 2 * angleWidth * t)
+
+        local direction = (
+            facing * math.cos(angle)
+            + right * math.sin(angle)
+        ).Unit
+
+        -- Cast from slightly above the character's feet.
+        local castOrigin = origin + Vector3.new(0, 1, 0)
+        local result = Workspace:Raycast(
+            castOrigin, direction * SCAN_RANGE, rayParams
+        )
+
+        if result and result.Instance:IsA("BasePart")
+            and result.Instance.CanCollide
+            and result.Normal.Y > 0.7 then
+
+            local hit = result.Position
+            local delta = hit - origin
+            local horizontal = Vector3.new(delta.X, 0, delta.Z)
+            local distance = horizontal.Magnitude
+            local height = delta.Y
+
+            if distance > 2
+                and height < MAX_TARGET_HEIGHT
+                and height > -MAX_TARGET_DROP then
+
+                local dot = facing:Dot(horizontal.Unit)
+
+                if dot > -0.05 then
+                    local entry, key = getMemory(hit)
+
+                    -- Recent failures cost more; successful landings
+                    -- slightly improve the score.
+                    local failurePenalty = entry.failures * 5
+                    if os.clock() - entry.lastFailure > 18 then
+                        failurePenalty = failurePenalty * 0.5
+                    end
+
+                    local score =
+                        dot * 12
+                        - distance * 0.28
+                        - math.abs(height - 2) * 0.65
+                        - failurePenalty
+                        + math.min(entry.successes, 5) * 1.5
+
+                    -- Prefer a wider surface when other factors
+                    -- are approximately equal.
+                    score += math.min(
+                        result.Instance.Size.X,
+                        result.Instance.Size.Z
+                    ) * 0.12
+
+                    if score > bestScore then
+                        bestScore = score
+                        bestPosition = hit
+                        bestPart = result.Instance
+                        bestKey = key
+                    end
+                end
+            end
+        end
+    end
+
+    return bestPosition, bestPart, bestKey
 end
 
--- ===== MAIN DECISION =====
-local function recompute()
-    if not humanoid or not hrp then return end
-    local rootPos = hrp.Position
-    local facing = hrp.CFrame.LookVector
-    local now = tick()
+local function computeMove()
+    if not root or not humanoid then return end
 
-    if rootPos.Y < -50 then
-        currentStatus = "RECOVERING"
-        cachedMoveDir = Vector3.zero
-        cachedShouldJump = false
-        return
+    -- Discard deleted or obviously outdated targets.
+    if targetPart and not targetPart.Parent then
+        targetPosition = nil
+        targetPart = nil
+        lastTargetKey = nil
     end
 
-    if (rootPos - lastPos).Magnitude > STUCK_PROGRESS_THRESHOLD then
-        lastPos = rootPos
-        lastProgressTime = now
-    elseif now - lastProgressTime > STUCK_TIMEOUT then
-        currentStatus = "RECOVERING"
-        if humanoid.FloorMaterial ~= Enum.Material.Air then
-            humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
+    if targetPosition then
+        local offset = targetPosition - root.Position
+
+        if offset.Magnitude > SCAN_RANGE + 12
+            or offset.Y > MAX_TARGET_HEIGHT + 3
+            or offset.Y < -MAX_TARGET_DROP - 3 then
+            targetPosition = nil
+            targetPart = nil
+            lastTargetKey = nil
         end
-        lastProgressTime = now
     end
 
-    if detectLadder(rootPos, facing) then
-        currentStatus = "LADDER"
-        cachedMoveDir = Vector3.new(facing.X, 0, facing.Z).Unit
-        cachedShouldJump = true
+    if not targetPosition then
+        local pos, part, key = scanPlatforms()
+
+        if pos then
+            targetPosition = pos
+            targetPart = part
+            lastTargetKey = key
+        end
+    end
+
+    if not targetPosition then
+        status = "SCANNING"
+        moveDirection = Vector3.zero
+        jumpRequested = false
         return
     end
 
-    local targetPos: Vector3? = nil
-    if currentTarget and currentTarget.Parent then
-        targetPos = currentTarget.Position
-    else
-        currentStatus = "SCANNING"
-        currentTarget = scanForPlatforms(rootPos, facing)
-        if currentTarget then targetPos = currentTarget.Position end
-    end
+    local origin = root.Position
+    local delta = targetPosition - origin
+    local flat = Vector3.new(delta.X, 0, delta.Z)
+    local distance = flat.Magnitude
 
-    if not targetPos then
-        currentStatus = "SCANNING"
-        cachedMoveDir = Vector3.new(facing.X, 0, facing.Z).Unit
-        cachedShouldJump = false
+    -- Check for a successful landing on the chosen surface.
+    if humanoid.FloorMaterial ~= Enum.Material.Air
+        and targetPart
+        and (root.Position - targetPosition).Magnitude < 7 then
+
+        recordSuccess()
+        targetPosition = nil
+        targetPart = nil
+        moveDirection = Vector3.zero
+        jumpRequested = false
+        status = "LANDED"
         return
     end
 
-    local toTarget = Vector3.new(targetPos.X - rootPos.X, 0, targetPos.Z - rootPos.Z)
-    local flatDist = toTarget.Magnitude
-    if flatDist < 0.5 then
-        currentTarget = nil
-        cachedMoveDir = Vector3.zero
+    if distance < 0.7 then
+        moveDirection = Vector3.zero
+        jumpRequested = false
         return
     end
 
-    local moveDir = toTarget.Unit
-    if flatDist < EDGE_APPROACH_DIST then
-        moveDir = moveDir * math.max(0.5, flatDist / EDGE_APPROACH_DIST)
+    local direction = flat.Unit
+    moveDirection = direction
+
+    -- Check the ground ahead at several points.
+    local gapDetected = false
+    local lookDistance = math.min(distance, 6)
+
+    for _, fraction in ipairs({0.45, 0.8, 1.15}) do
+        local point = origin
+            + direction * math.min(lookDistance * fraction, 6)
+            + Vector3.new(0, -2.5, 0)
+
+        if not groundAt(point, 7) then
+            gapDetected = true
+            break
+        end
     end
 
-    local shouldJump = false
-    local heightDiff = targetPos.Y - rootPos.Y
+    local heightDifference = targetPosition.Y - origin.Y
+    local needsJump =
+        (gapDetected and distance > 2.8 and distance < 15)
+        or (heightDifference > 2.5 and distance < 12)
+
+    -- Alter the jump trigger after repeated failures.
+    if jumpAttempts >= 2 and distance < 10
+        and heightDifference > 0.5 then
+        needsJump = true
+    end
+
+    jumpRequested = needsJump
+    status = needsJump and "JUMPING" or "MOVING"
+end
+
+-- Track falls and lack of progress.
+local function trackProgress()
+    if not root or not humanoid then return end
+
+    local position = root.Position
     local grounded = humanoid.FloorMaterial ~= Enum.Material.Air
 
-    local aheadOrigin = rootPos + Vector3.new(0, -2.5, 0) + moveDir.Unit * math.min(flatDist, 4)
-    if not hasGroundBelow(aheadOrigin, 8) and flatDist > 2 and flatDist < 14 then
-        shouldJump = true
-    end
-    if heightDiff > 2.5 and flatDist < 12 then shouldJump = true end
+    if grounded then
+        lastGroundedPosition = position
+        lastGroundedTime = os.clock()
+        fallStartY = nil
+    else
+        if not fallStartY then
+            fallStartY = position.Y
+        end
 
-    if WALLHOP_ENABLED and grounded then
-        local wallDir = detectWall(rootPos, facing)
-        if wallDir and now - lastWallhopTime > WALLHOP_COOLDOWN then
-            local wallRes = Workspace:Raycast(rootPos + Vector3.new(0, 1, 0), wallDir * WALL_CHECK_DIST, rayParams)
-            if wallRes and wallRes.Instance:IsA("BasePart")
-                and math.abs(wallRes.Normal.Y) < 0.4 then
-                currentStatus = "WALLHOP"
-                humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
-                lastWallhopTime = now
-                moveDir = (moveDir + wallDir * 0.6).Unit
-            end
+        -- A substantial downward drop without a landing is a likely
+        -- failed attempt. Do not repeatedly count the same fall.
+        if fallStartY and position.Y < fallStartY - 14 then
+            recordFailure()
+            fallStartY = nil
+            status = "REPLANNING"
         end
     end
 
-    cachedMoveDir = moveDir
-    cachedShouldJump = shouldJump
-    if currentStatus ~= "WALLHOP" and currentStatus ~= "LADDER" then
-        currentStatus = "MOVING"
+    if lastProgressPosition then
+        local moved = (position - lastProgressPosition).Magnitude
+        if moved < 0.3 and grounded then
+            stuckTime += 0.1
+        else
+            stuckTime = 0
+        end
+
+        if stuckTime > 2.5 then
+            -- Abandon a stale target and try a new route.
+            targetPosition = nil
+            targetPart = nil
+            lastTargetKey = nil
+            stuckTime = 0
+            status = "REPLANNING"
+        end
     end
+
+    lastProgressPosition = position
 end
 
--- ===== APPLY EVERY FRAME =====
-RunService.RenderStepped:Connect(function(dt)
-    if not botEnabled or not humanoid or not hrp then return end
+-- Main loop
+button.Activated:Connect(function()
+    enabled = not enabled
 
-    scanAccum += dt
-    if scanAccum >= SCAN_INTERVAL then
-        scanAccum = 0
-        local ok, err = pcall(recompute)
+    if enabled then
+        targetPosition = nil
+        targetPart = nil
+        lastTargetKey = nil
+        moveDirection = Vector3.zero
+        jumpRequested = false
+        scanTimer = 0
+        status = "SCANNING"
+    else
+        moveDirection = Vector3.zero
+        jumpRequested = false
+
+        if humanoid then
+            humanoid:Move(Vector3.zero, false)
+        end
+
+        status = "BOT OFF"
+    end
+
+    updateButton()
+end)
+
+RunService.Heartbeat:Connect(function(dt)
+    if not enabled or not humanoid or not root
+        or humanoid.Health <= 0 then
+        return
+    end
+
+    scanTimer += dt
+    progressTimer += dt
+
+    if scanTimer >= SCAN_INTERVAL then
+        scanTimer = 0
+
+        local ok, err = pcall(computeMove)
         if not ok then
-            warn("[ObbyBot]", err)
-            currentStatus = "RECOVERING"
+            warn("[Adaptive TOH Bot]", err)
+            status = "ERROR"
         end
     end
 
-    if cachedMoveDir.Magnitude > 0.01 then
-        humanoid:Move(cachedMoveDir, false)
-    else
-        humanoid:Move(Vector3.zero, false)
+    if progressTimer >= 0.1 then
+        progressTimer = 0
+        trackProgress()
     end
 
-    if cachedShouldJump then
-        local now = tick()
-        if humanoid.FloorMaterial ~= Enum.Material.Air and now - lastJumpTime > JUMP_COOLDOWN then
-            humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
-            lastJumpTime = now
-            if currentStatus ~= "WALLHOP" and currentStatus ~= "LADDER" then
-                currentStatus = "JUMPING"
-            end
-            cachedShouldJump = false
-        elseif currentStatus == "LADDER" then
-            if now - lastLadderSpam > LADDER_SPAM_INTERVAL then
-                humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
-                lastLadderSpam = now
-            end
-        end
+    if moveDirection.Magnitude > 0.01 then
+        humanoid:Move(moveDirection, false)
     end
+
+    if jumpRequested
+        and humanoid.FloorMaterial ~= Enum.Material.Air
+        and os.clock() - lastJump >= JUMP_COOLDOWN then
+
+        humanoid.Jump = true
+        humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
+
+        lastJump = os.clock()
+        jumpRequested = false
+    end
+
+    updateButton()
 end)
 
--- ===== TOGGLE =====
-toggleBtn.MouseButton1Click:Connect(function()
-    botEnabled = not botEnabled
-    if botEnabled then
-        toggleBtn.BackgroundColor3 = Color3.fromRGB(70, 150, 70)
-        lastPos = hrp and hrp.Position or Vector3.zero
-        lastProgressTime = tick()
-        currentTarget = nil
-        cachedMoveDir = Vector3.zero
-        cachedShouldJump = false
-    else
-        toggleBtn.Text = "BOT OFF"
-        toggleBtn.BackgroundColor3 = Color3.fromRGB(60, 60, 65)
-        cachedMoveDir = Vector3.zero
-        cachedShouldJump = false
-        if humanoid then humanoid:Move(Vector3.zero, false) end
-    end
-end)
-
-RunService.Heartbeat:Connect(function()
-    if botEnabled then toggleBtn.Text = currentStatus end
-end)
+print("[Adaptive TOH Bot] Loaded. Tap the button to start.")
