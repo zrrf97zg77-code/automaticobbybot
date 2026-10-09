@@ -1,195 +1,309 @@
-
---// OBBY BOT — PLATFORM NAVIGATION PROTOTYPE
---// Toggle: ON/OFF
---// Designed for testing in an authorized obby environment.
+--!strict
+-- Obby Auto-Runner v2 — Client LocalScript
+-- Place in StarterPlayer/StarterPlayerScripts
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local Workspace = game:GetService("Workspace")
 
 local player = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
 
-local CONFIG = {
-    ScanDistance = 50,
-    ArrivalDistance = 4,
-    JumpHeightTrigger = 3,
-    JumpCooldown = 0.8,
-    MoveSpeed = 1,
-}
+-- CONFIG
+local SCAN_RANGE = 50
+local SCAN_HALF_ANGLE = 55          -- degrees left/right of facing
+local RAY_COUNT = 9                 -- rays per scan sweep
+local MOVEMENT_UPDATE_RATE = 0.08   -- seconds between scans
+local EDGE_APPROACH_DIST = 3.5
+local JUMP_CHECK_INTERVAL = 0.15
+local STUCK_TIMEOUT = 1.5           -- seconds without meaningful progress
+local STUCK_PROGRESS_THRESHOLD = 0.5
 
-local enabled = false
-local currentTarget = nil
-local lastJump = 0
-local heartbeatConnection
-local characterConnection
+-- STATE
+local botEnabled = false
+local currentStatus = "BOT OFF"
+local humanoid: Humanoid? = nil
+local hrp: BasePart? = nil
+local lastPos = Vector3.zero
+local lastProgressTime = 0
+local lastJumpTime = 0
+local currentTarget: BasePart? = nil
+local isJumping = false
 
--- GUI
-local gui = Instance.new("ScreenGui")
-gui.Name = "ObbyBotUI"
-gui.ResetOnSpawn = false
+-- SERVICES / FILTERS
+local rayParams = RaycastParams.new()
+rayParams.FilterType = Enum.RaycastFilterType.Exclude
+rayParams.IgnoreWater = true
 
-local ok = pcall(function()
-    gui.Parent = game:GetService("CoreGui")
-end)
+-- UI (minimal toggle)
+local screenGui = Instance.new("ScreenGui")
+screenGui.Name = "ObbyBotUI"
+screenGui.ResetOnSpawn = false
+screenGui.Parent = playerGui
 
-if not ok or not gui.Parent then
-    gui.Parent = player:WaitForChild("PlayerGui")
+local toggleBtn = Instance.new("TextButton")
+toggleBtn.Size = UDim2.new(0, 70, 0, 38)
+toggleBtn.Position = UDim2.new(0, 12, 0, 12)
+toggleBtn.BackgroundColor3 = Color3.fromRGB(60, 60, 65)
+toggleBtn.TextColor3 = Color3.fromRGB(240, 240, 240)
+toggleBtn.TextSize = 13
+toggleBtn.Font = Enum.Font.GothamBold
+toggleBtn.Text = "BOT OFF"
+toggleBtn.AutoButtonColor = false
+toggleBtn.Parent = screenGui
+
+local corner = Instance.new("UICorner")
+corner.CornerRadius = UDim.new(0, 8)
+corner.Parent = toggleBtn
+
+-- CHARACTER BINDING
+local function onCharacter(char: Model)
+    local h = char:WaitForChild("Humanoid", 5) :: Humanoid?
+    local r = char:WaitForChild("HumanoidRootPart", 5) :: BasePart?
+    if not h or not r then return end
+    humanoid = h
+    hrp = r
+    isJumping = false
+    currentTarget = nil
+    lastPos = r.Position
+    lastProgressTime = tick()
+
+    -- update ray filter to exclude own character
+    rayParams.FilterDescendantsInstances = { char }
 end
 
-local button = Instance.new("TextButton")
-button.Name = "Toggle"
-button.Size = UDim2.fromOffset(110, 42)
-button.Position = UDim2.new(0, 20, 0.45, 0)
-button.BackgroundColor3 = Color3.fromRGB(45, 45, 45)
-button.TextColor3 = Color3.new(1, 1, 1)
-button.Text = "BOT: OFF"
-button.TextSize = 16
-button.Font = Enum.Font.GothamBold
-button.Parent = gui
-
-Instance.new("UICorner", button).CornerRadius =
-    UDim.new(0, 10)
-
-local function getCharacter()
-    local character = player.Character
-    if not character then return end
-
-    local humanoid =
-        character:FindFirstChildOfClass("Humanoid")
-    local root =
-        character:FindFirstChild("HumanoidRootPart")
-
-    if humanoid and root and humanoid.Health > 0 then
-        return character, humanoid, root
-    end
+player.CharacterAdded:Connect(onCharacter)
+if player.Character then
+    task.defer(onCharacter, player.Character)
 end
 
--- Find nearby platform-like parts.
-local function findTarget(root)
-    local bestPart = nil
-    local bestScore = math.huge
+-- UTILITY: angle between two horizontal vectors
+local function horizontalAngle(v1: Vector3, v2: Vector3): number
+    local d1 = Vector3.new(v1.X, 0, v1.Z).Unit
+    local d2 = Vector3.new(v2.X, 0, v2.Z).Unit
+    return math.deg(math.acos(math.clamp(d1:Dot(d2), -1, 1)))
+end
 
-    for _, part in ipairs(Workspace:GetDescendants()) do
-        if not part:IsA("BasePart")
-            or not part.Anchored
-            or not part.CanCollide
-            or part.Transparency >= 1 then
-            continue
-        end
+-- SCAN: cast rays in a forward cone, return best reachable part
+local function scanForPlatforms(origin: Vector3, facing: Vector3): BasePart?
+    local bestPart: BasePart? = nil
+    local bestScore = -math.huge
 
-        if part.Size.X < 2 or part.Size.Z < 2 then
-            continue
-        end
+    local fwd = Vector3.new(facing.X, 0, facing.Z).Unit
+    local right = Vector3.new(fwd.Z, 0, -fwd.X)
 
-        local offset = part.Position - root.Position
-        local horizontal = Vector3.new(
-            offset.X, 0, offset.Z
-        ).Magnitude
+    for i = 0, RAY_COUNT - 1 do
+        local t = (i / (RAY_COUNT - 1)) * 2 - 1
+        local angleRad = math.rad(SCAN_HALF_ANGLE * t)
+        local dir = (fwd * math.cos(angleRad) + right * math.sin(angleRad)).Unit
 
-        local vertical = offset.Y
+        -- forward scan
+        local result = Workspace:Raycast(origin, dir * SCAN_RANGE, rayParams)
+        if not result then continue end
+        local part = result.Instance
+        if not part:IsA("BasePart") or part.Anchored == false then continue end
+        if part.CanCollide == false then continue end
 
-        if horizontal > CONFIG.ScanDistance
-            or vertical < -2
-            or vertical > 18 then
-            continue
-        end
+        -- must be roughly horizontal (floor-like)
+        if math.abs(result.Normal.Y) < 0.7 then continue end
 
-        -- Prefer platforms ahead and above, but avoid
-        -- selecting the floor directly beneath the player.
-        if horizontal < 5 and math.abs(vertical) < 2 then
-            continue
-        end
+        -- distance and height scoring
+        local hitPos = result.Position
+        local dist = (hitPos - origin).Magnitude
+        local heightDiff = hitPos.Y - origin.Y
 
-        local score = horizontal + math.abs(vertical) * 1.5
+        if heightDiff > 6 or heightDiff < -18 then continue end
+        if dist < 2.5 then continue end
 
-        if score < bestScore then
+        -- score: prefer close, slightly higher, and aligned with facing
+        local score = 0
+        score += (SCAN_RANGE - dist) * 1.2
+        score += math.abs(heightDiff - 2) * -0.5
+        score += (1 - math.abs(t)) * 4
+
+        if score > bestScore then
             bestScore = score
             bestPart = part
         end
     end
-
     return bestPart
 end
 
-local function stopMovement(humanoid)
-    if humanoid then
-        humanoid:Move(Vector3.zero, false)
+-- CHECK: is there ground below within jump reach?
+local function hasGroundBelow(pos: Vector3, maxDepth: number): boolean
+    local result = Workspace:Raycast(pos, Vector3.new(0, -maxDepth, 0), rayParams)
+    if result and result.Instance:IsA("BasePart") and result.Instance.CanCollide then
+        if math.abs(result.Normal.Y) > 0.7 then
+            return true
+        end
+    end
+    return false
+end
+
+-- MAIN MOVEMENT LOGIC
+local function updateBot()
+    if not botEnabled or not humanoid or not hrp then
+        return
+    end
+
+    local rootPos = hrp.Position
+    local rootVel = hrp.AssemblyLinearVelocity
+    local facing = hrp.CFrame.LookVector
+
+    -- detect falling / respawn
+    if rootPos.Y < -50 then
+        currentStatus = "RECOVERING"
+        return
+    end
+
+    -- stuck detection
+    local now = tick()
+    if (rootPos - lastPos).Magnitude > STUCK_PROGRESS_THRESHOLD then
+        lastPos = rootPos
+        lastProgressTime = now
+    elseif now - lastProgressTime > STUCK_TIMEOUT then
+        currentStatus = "RECOVERING"
+        -- jump out of stuck state
+        if humanoid.FloorMaterial ~= Enum.Material.Air then
+            humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
+        end
+        lastProgressTime = now
+        return
+    end
+
+    -- reacquire target if needed
+    local targetPos: Vector3? = nil
+    if currentTarget and currentTarget.Parent then
+        targetPos = currentTarget.Position
+    else
+        currentStatus = "SCANNING"
+        currentTarget = scanForPlatforms(rootPos, facing)
+        if currentTarget then
+            targetPos = currentTarget.Position
+        end
+    end
+
+    if not targetPos then
+        currentStatus = "SCANNING"
+        -- no platform found: walk forward cautiously
+        humanoid:Move(facing, false)
+        return
+    end
+
+    -- horizontal direction to target
+    local toTarget = Vector3.new(
+        targetPos.X - rootPos.X,
+        0,
+        targetPos.Z - rootPos.Z
+    )
+    local flatDist = toTarget.Magnitude
+
+    if flatDist < 0.5 then
+        currentTarget = nil
+        currentStatus = "SCANNING"
+        return
+    end
+
+    local moveDir = toTarget.Unit
+
+    -- edge approach: slow down near target edge
+    local speedMult = 1
+    if flatDist < EDGE_APPROACH_DIST then
+        speedMult = math.max(0.35, flatDist / EDGE_APPROACH_DIST)
+    end
+    moveDir = moveDir * speedMult
+
+    -- --- JUMP DECISION ---
+    local shouldJump = false
+    local heightDiff = targetPos.Y - rootPos.Y
+
+    -- check if ground disappears ahead (gap)
+    local aheadCheckDist = math.min(flatDist, 4)
+    local aheadOrigin = rootPos + Vector3.new(0, -2.5, 0) + moveDir.Unit * aheadCheckDist
+    local groundAhead = hasGroundBelow(aheadOrigin, 8)
+
+    -- jump if gap detected and on ground
+    if not groundAhead and flatDist > 2 and flatDist < 14 then
+        shouldJump = true
+    end
+
+    -- jump if target is significantly higher
+    if heightDiff > 2.5 and flatDist < 12 then
+        shouldJump = true
+    end
+
+    -- jump if stuck against a wall (velocity low but trying to move)
+    if rootVel.Magnitude < 1.5 and flatDist > 3 and flatDist < 10 then
+        shouldJump = true
+    end
+
+    -- execute jump with cooldown
+    if shouldJump and now - lastJumpTime > JUMP_CHECK_INTERVAL then
+        if humanoid.FloorMaterial ~= Enum.Material.Air then
+            currentStatus = "JUMPING"
+            humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
+            lastJumpTime = now
+            isJumping = true
+        end
+    elseif isJumping then
+        currentStatus = "MOVING"
+    else
+        currentStatus = "MOVING"
+    end
+
+    -- apply movement every frame
+    humanoid:Move(moveDir, false)
+
+    -- clear jump state when grounded again
+    if humanoid.FloorMaterial ~= Enum.Material.Air then
+        isJumping = false
     end
 end
 
-button.Activated:Connect(function()
-    enabled = not enabled
-    button.Text = enabled and "BOT: ON" or "BOT: OFF"
-    button.BackgroundColor3 = enabled
-        and Color3.fromRGB(30, 140, 80)
-        or Color3.fromRGB(45, 45, 45)
-
-    if not enabled then
-        local _, humanoid = getCharacter()
-        stopMovement(humanoid)
-        currentTarget = nil
-    end
-end)
-
-heartbeatConnection = RunService.Heartbeat:Connect(function()
-    if not enabled then return end
-
-    local _, humanoid, root = getCharacter()
-    if not humanoid or not root then return end
-
-    -- Refresh target when needed.
-    if not currentTarget
-        or not currentTarget.Parent
-        or (currentTarget.Position - root.Position).Magnitude
-            > CONFIG.ScanDistance + 10 then
-        currentTarget = findTarget(root)
-    end
-
-    if not currentTarget then
-        stopMovement(humanoid)
+-- UPDATE LOOP (throttled for performance)
+local scanAccum = 0
+RunService.RenderStepped:Connect(function(dt)
+    if not botEnabled then
         return
     end
+    scanAccum += dt
+    if scanAccum >= MOVEMENT_UPDATE_RATE then
+        scanAccum = 0
+        local ok, err = pcall(updateBot)
+        if not ok then
+            warn("[ObbyBot] Error:", err)
+            currentStatus = "RECOVERING"
+        end
+    end
+    -- apply movement every frame for smooth control
+    if humanoid and hrp then
+        -- movement vector is set inside updateBot; if we're between scans,
+        -- keep the last direction by calling Move with stored direction
+        -- (updateBot handles this)
+    end
+end)
 
-    local offset = currentTarget.Position - root.Position
-    local horizontal = Vector3.new(offset.X, 0, offset.Z)
-    local distance = horizontal.Magnitude
-
-    if distance <= CONFIG.ArrivalDistance then
-        stopMovement(humanoid)
+-- TOGGLE BUTTON
+toggleBtn.MouseButton1Click:Connect(function()
+    botEnabled = not botEnabled
+    if botEnabled then
+        toggleBtn.Text = "SCANNING"
+        toggleBtn.BackgroundColor3 = Color3.fromRGB(70, 150, 70)
+        lastPos = hrp and hrp.Position or Vector3.zero
+        lastProgressTime = tick()
         currentTarget = nil
-        return
-    end
-
-    if distance > 0 then
-        -- Move in the target direction, relative to the world.
-        humanoid:Move(horizontal.Unit * CONFIG.MoveSpeed, false)
-    end
-
-    -- Attempt a jump for a platform above the character.
-    if offset.Y > CONFIG.JumpHeightTrigger
-        and os.clock() - lastJump >= CONFIG.JumpCooldown
-        and humanoid.FloorMaterial ~= Enum.Material.Air then
-
-        lastJump = os.clock()
-        humanoid.Jump = true
+    else
+        toggleBtn.Text = "BOT OFF"
+        toggleBtn.BackgroundColor3 = Color3.fromRGB(60, 60, 65)
+        if humanoid then
+            humanoid:Move(Vector3.zero, false)
+        end
     end
 end)
 
-player.CharacterAdded:Connect(function()
-    currentTarget = nil
-    lastJump = 0
-end)
-
-script.Destroying:Connect(function()
-    enabled = false
-
-    if heartbeatConnection then
-        heartbeatConnection:Disconnect()
+-- STATUS DISPLAY
+RunService.Heartbeat:Connect(function()
+    if botEnabled then
+        toggleBtn.Text = currentStatus
     end
-
-    if characterConnection then
-        characterConnection:Disconnect()
-    end
-
-    gui:Destroy()
 end)
