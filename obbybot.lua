@@ -1,5 +1,5 @@
 --!strict
--- Obby Auto-Runner v5 — Whitelist + Position-Only Shiftlock + Speed Boost
+-- Obby Auto-Runner v5.1 — No shiftlock, no speed boost
 -- Place in StarterPlayer/StarterPlayerScripts
 
 local Players = game:GetService("Players")
@@ -20,12 +20,6 @@ local JUMP_COOLDOWN = 0.18
 local STUCK_TIMEOUT = 1.5
 local STUCK_PROGRESS_THRESHOLD = 0.5
 
--- SPEED BOOST
-local BOOST_WALKSPEED = 50
-local BOOST_JUMPPOWER = 80
-local DEFAULT_WALKSPEED = 16
-local DEFAULT_JUMPPOWER = 50
-
 -- WALLHOP / LADDER
 local WALL_CHECK_DIST = 4.5
 local WALLHOP_ENABLED = true
@@ -34,8 +28,8 @@ local LADDER_SPAM_INTERVAL = 0.12
 local LADDER_DETECT_DIST = 4
 
 -- ===== WHITELIST =====
-local WHITELIST_FOLDER_NAME = "Obby"          -- nil to disable
-local WHITELIST_TAG = "ObbyPlatform"          -- nil to disable
+local WHITELIST_FOLDER_NAME = "Obby"
+local WHITELIST_TAG = "ObbyPlatform"
 
 local function getWhitelistInstances(): {Instance}
     local list = {}
@@ -56,7 +50,6 @@ local botEnabled = false
 local currentStatus = "BOT OFF"
 local humanoid: Humanoid? = nil
 local hrp: BasePart? = nil
-local shiftlockActive = false
 
 local lastPos = Vector3.zero
 local lastProgressTime = 0
@@ -67,7 +60,6 @@ local currentTarget: BasePart? = nil
 local cachedMoveDir = Vector3.zero
 local cachedShouldJump = false
 local scanAccum = 0
-local shiftlockConn: RBXScriptConnection? = nil
 
 -- ===== RAYCAST (whitelist only) =====
 local rayParams = RaycastParams.new()
@@ -93,47 +85,11 @@ toggleBtn.AutoButtonColor = false
 toggleBtn.Parent = screenGui
 Instance.new("UICorner", toggleBtn).CornerRadius = UDim.new(0, 8)
 
--- ===== SHIFTLOCK (position-only, camera untouched) =====
-local function setShiftlock(active: boolean)
-    if not hrp or not humanoid then return end
-
-    if active then
-        humanoid.AutoRotate = false
-        -- CameraOffset intentionally NOT modified
-
-        shiftlockConn = RunService:BindToRenderStep("ObbyShiftlock",
-            Enum.RenderPriority.Character.Value, function()
-            local cam = Workspace.CurrentCamera
-            if not cam or not hrp then return end
-            local look = cam.CFrame.LookVector
-            local flat = Vector3.new(look.X, 0, look.Z)
-            if flat.Magnitude > 0.01 then
-                -- Rotate root only, in place. Camera untouched.
-                hrp.CFrame = CFrame.new(hrp.Position, hrp.Position + flat.Unit)
-            end
-        end)
-        shiftlockActive = true
-    else
-        humanoid.AutoRotate = true
-        if shiftlockConn then
-            RunService:UnbindFromRenderStep("ObbyShiftlock")
-            shiftlockConn = nil
-        end
-        shiftlockActive = false
-    end
-end
-
 -- ===== CHARACTER BIND =====
 local function onCharacter(char: Model)
     local h = char:WaitForChild("Humanoid", 5) :: Humanoid?
     local r = char:WaitForChild("HumanoidRootPart", 5) :: BasePart?
     if not h or not r then return end
-
-    if shiftlockConn then
-        RunService:UnbindFromRenderStep("ObbyShiftlock")
-        shiftlockConn = nil
-        shiftlockActive = false
-    end
 
     humanoid = h
     hrp = r
@@ -141,13 +97,10 @@ local function onCharacter(char: Model)
     lastPos = r.Position
     lastProgressTime = tick()
 
-    -- clean camera offset in case an old run set it
-    h.CameraOffset = Vector3.new(0, 0, 0)
+    -- make sure no leftover shiftlock state sticks around
     h.AutoRotate = true
-    h.WalkSpeed = DEFAULT_WALKSPEED
-    h.JumpPower = DEFAULT_JUMPPOWER
+    h.CameraOffset = Vector3.new(0, 0, 0)
 
-    -- rebuild whitelist filter, exclude own character
     local filter = getWhitelistInstances()
     table.insert(filter, char)
     rayParams.FilterDescendantsInstances = filter
@@ -221,7 +174,7 @@ local function detectLadder(pos: Vector3, facing: Vector3): boolean
     return name:find("ladder") ~= nil or name:find("truss") ~= nil
 end
 
--- ===== MAIN DECISION (throttled) =====
+-- ===== MAIN DECISION =====
 local function recompute()
     if not humanoid or not hrp then return end
     local rootPos = hrp.Position
@@ -361,26 +314,12 @@ toggleBtn.MouseButton1Click:Connect(function()
         currentTarget = nil
         cachedMoveDir = Vector3.zero
         cachedShouldJump = false
-
-        -- enable speed boost + shiftlock on start
-        if humanoid then
-            humanoid.WalkSpeed = BOOST_WALKSPEED
-            humanoid.JumpPower = BOOST_JUMPPOWER
-        end
-        if hrp and humanoid then setShiftlock(true) end
     else
         toggleBtn.Text = "BOT OFF"
         toggleBtn.BackgroundColor3 = Color3.fromRGB(60, 60, 65)
         cachedMoveDir = Vector3.zero
         cachedShouldJump = false
-
-        -- restore defaults on stop
-        if humanoid then
-            humanoid:Move(Vector3.zero, false)
-            humanoid.WalkSpeed = DEFAULT_WALKSPEED
-            humanoid.JumpPower = DEFAULT_JUMPPOWER
-        end
-        setShiftlock(false)
+        if humanoid then humanoid:Move(Vector3.zero, false) end
     end
 end)
 
