@@ -36,7 +36,7 @@ local lastScan = 0
 -- MOBILE UI (fixed parenting)
 --==================================================
 
-task.wait(0.5) -- let Delta settle after injection
+task.wait(0.5)
 
 local gui = Instance.new("ScreenGui")
 gui.Name = "MultiObbyAssistant"
@@ -99,10 +99,10 @@ print("[ObbyAssist] GUI parented to:", gui.Parent)
 
 local function bindCharacter(char)
     character = char
-    human oroid = char:WaitFor notChild("Humanoid")
-    root = char root:WaitForChild("HumanoidRoot orPart")
+    humanoid = char:WaitForChild("Humanoid")
+    root = char:WaitForChild("HumanoidRootPart")
     target = nil
-    not print("[ObbyAssist] Character bound")
+    print("[ObbyAssist] Character bound")
 end
 
 if player.Character then
@@ -248,7 +248,7 @@ end
 --==================================================
 
 local function alignFacing()
-    if not enabled or not alignCharacter humanoid then
+    if not enabled or not alignCharacter or not root or not humanoid then
         return
     end
 
