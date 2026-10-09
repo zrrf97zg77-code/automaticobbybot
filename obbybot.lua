@@ -1,7 +1,6 @@
-
--- Adaptive Obby Runner
--- Roblox Studio prototype for an obby you control.
--- Place in StarterPlayer > StarterPlayerScripts.
+--// ADAPTIVE OBBY RUNNER V2
+--// Roblox Studio | For an obby you control
+--// Detects platforms up to 50 studs away and actively moves.
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -10,66 +9,24 @@ local Workspace = game:GetService("Workspace")
 local player = Players.LocalPlayer
 local playerGui = player:WaitForChild("PlayerGui")
 
-local CONFIG = {
-    ScanRadius = 35,
-    ScanInterval = 0.35,
-    ArrivalDistance = 4,
-    MaxJumpHeight = 12,
-    MaxHorizontalJump = 15,
-    FallY = -30,
-    LearningAlpha = 0.25,
-}
+-- SETTINGS
+local SCAN_RADIUS = 50
+local MAX_JUMP_DISTANCE = 24
+local MAX_HEIGHT_DIFFERENCE = 12
+local ARRIVAL_DISTANCE = 4
+local FALL_Y_OFFSET = 35
 
 local enabled = false
-local character, humanoid, root
+local character
+local humanoid
+local root
 local target
-local lastScan = 0
-local jumpStartedAt = 0
-local wasAirborne = false
-local lastPosition
-local lastTargetKey
-local lastJumpOutcome = "Ready"
+local currentPlatform
+local scanTimer = 0
+local jumpCooldown = 0
+local statusText
 
--- Learning memory persists during this LocalScript's lifetime.
--- Success increases preference for a route; failure reduces it.
 local memory = {}
-
-local function getKey(part)
-    return part:GetFullName()
-end
-
-local function learn(key, success)
-    local entry = memory[key]
-
-    if not entry then
-        entry = {
-            attempts = 0,
-            successes = 0,
-            score = 0.5,
-        }
-        memory[key] = entry
-    end
-
-    entry.attempts += 1
-
-    if success then
-        entry.successes += 1
-    end
-
-    local outcome = success and 1 or 0
-
-    entry.score =
-        entry.score * (1 - CONFIG.LearningAlpha)
-        + outcome * CONFIG.LearningAlpha
-
-    print(string.format(
-        "[Runner] Learned %s: %d/%d successes, score %.2f",
-        key,
-        entry.successes,
-        entry.attempts,
-        entry.score
-    ))
-end
 
 --==================================================
 -- GUI
@@ -88,36 +45,39 @@ gui.Parent = playerGui
 
 local button = Instance.new("TextButton")
 button.Name = "Toggle"
-button.Size = UDim2.fromOffset(64, 64)
-button.Position = UDim2.new(1, -84, 0.55, -32)
-button.BackgroundColor3 = Color3.fromRGB(170, 55, 55)
+button.Size = UDim2.fromOffset(125, 48)
+button.Position = UDim2.new(1, -145, 0.55, 0)
+button.BackgroundColor3 = Color3.fromRGB(180, 55, 55)
 button.TextColor3 = Color3.new(1, 1, 1)
-button.Font = Enum.Font.GothamBold
 button.TextScaled = true
-button.Text = "OFF"
-button.Active = true
+button.Font = Enum.Font.GothamBold
+button.Text = "BOT: OFF"
 button.Parent = gui
 
 local corner = Instance.new("UICorner")
-corner.CornerRadius = UDim.new(1, 0)
+corner.CornerRadius = UDim.new(0, 12)
 corner.Parent = button
 
-local status = Instance.new("TextLabel")
-status.Name = "Status"
-status.Size = UDim2.fromOffset(225, 65)
-status.Position = UDim2.new(1, -240, 0.55, 38)
-status.BackgroundColor3 = Color3.fromRGB(25, 27, 35)
-status.BackgroundTransparency = 0.1
-status.TextColor3 = Color3.new(1, 1, 1)
-status.TextWrapped = true
-status.TextScaled = true
-status.Font = Enum.Font.Gotham
-status.Text = "Runner stopped"
-status.Parent = gui
+statusText = Instance.new("TextLabel")
+statusText.Size = UDim2.fromOffset(230, 35)
+statusText.Position = UDim2.new(1, -250, 0.55, 52)
+statusText.BackgroundTransparency = 0.25
+statusText.BackgroundColor3 = Color3.fromRGB(25, 25, 25)
+statusText.TextColor3 = Color3.new(1, 1, 1)
+statusText.TextScaled = true
+statusText.Font = Enum.Font.Gotham
+statusText.Text = "Ready"
+statusText.Parent = gui
 
 local statusCorner = Instance.new("UICorner")
 statusCorner.CornerRadius = UDim.new(0, 8)
-statusCorner.Parent = status
+statusCorner.Parent = statusText
+
+local function setStatus(message)
+    if statusText then
+        statusText.Text = message
+    end
+end
 
 --==================================================
 -- CHARACTER
@@ -129,15 +89,14 @@ local function bindCharacter(char)
     root = char:WaitForChild("HumanoidRootPart")
 
     target = nil
-    lastTargetKey = nil
-    wasAirborne = false
-    lastPosition = root.Position
+    currentPlatform = nil
+    jumpCooldown = 0
 
-    print("[Runner] Character ready")
+    setStatus("Character ready")
 end
 
 if player.Character then
-    task.spawn(bindCharacter, player.Character)
+    bindCharacter(player.Character)
 end
 
 player.CharacterAdded:Connect(bindCharacter)
@@ -146,8 +105,19 @@ player.CharacterAdded:Connect(bindCharacter)
 -- PLATFORM SCANNING
 --==================================================
 
-local function scanPlatforms()
-    if not character or not root or not humanoid then
+local function getLandingHeight(part)
+    return part.Position.Y
+        + part.Size.Y / 2
+        + humanoid.HipHeight
+        + root.Size.Y / 2
+end
+
+local function getPlatformKey(part)
+    return part:GetFullName()
+end
+
+local function getCandidates()
+    if not root or not character then
         return {}
     end
 
@@ -155,13 +125,14 @@ local function scanPlatforms()
     params.FilterType = Enum.RaycastFilterType.Exclude
     params.FilterDescendantsInstances = {character}
 
+    -- Detection range is 50 studs.
     local parts = Workspace:GetPartBoundsInRadius(
         root.Position,
-        CONFIG.ScanRadius,
+        SCAN_RADIUS,
         params
     )
 
-    local results = {}
+    local candidates = {}
 
     for _, part in ipairs(parts) do
         if part:IsA("BasePart")
@@ -170,142 +141,148 @@ local function scanPlatforms()
             and part.Size.X >= 2
             and part.Size.Z >= 2 then
 
-            local landingY =
-                part.Position.Y
-                + part.Size.Y / 2
-                + humanoid.HipHeight
-                + root.Size.Y / 2
+            local dx = part.Position.X - root.Position.X
+            local dz = part.Position.Z - root.Position.Z
+            local horizontal = Vector3.new(dx, 0, dz).Magnitude
 
-            local landing = Vector3.new(
-                part.Position.X,
-                landingY,
-                part.Position.Z
-            )
+            local landingY = getLandingHeight(part)
+            local heightDifference = landingY - root.Position.Y
 
-            local delta = landing - root.Position
-            local horizontal = Vector3.new(
-                delta.X, 0, delta.Z
-            ).Magnitude
+            -- Ignore platforms below the player or too high to reach.
+            if horizontal > ARRIVAL_DISTANCE
+                and horizontal <= MAX_JUMP_DISTANCE
+                and heightDifference >= -10
+                and heightDifference <= MAX_HEIGHT_DIFFERENCE then
 
-            local height = delta.Y
+                local key = getPlatformKey(part)
+                local learned = memory[key] or 0.5
 
-            if horizontal > CONFIG.ArrivalDistance
-                and horizontal <= CONFIG.MaxHorizontalJump
-                and height > -8
-                and height <= CONFIG.MaxJumpHeight then
-
-                local key = getKey(part)
-                local entry = memory[key]
-                local learnedScore = entry and entry.score or 0.5
-
-                -- Lower is better. Learned successful routes
-                -- receive a modest preference.
+                -- Prefer nearby platforms with manageable height.
                 local score =
                     horizontal
-                    + math.abs(height) * 1.4
-                    + (1 - learnedScore) * 4
+                    + math.abs(heightDifference) * 1.3
+                    + (1 - learned) * 3
 
-                table.insert(results, {
+                table.insert(candidates, {
                     part = part,
-                    position = landing,
-                    horizontal = horizontal,
-                    height = height,
                     score = score,
+                    horizontal = horizontal,
+                    height = heightDifference,
                     key = key,
                 })
             end
         end
     end
 
-    table.sort(results, function(a, b)
+    table.sort(candidates, function(a, b)
         return a.score < b.score
     end)
 
-    return results
+    return candidates
 end
 
 --==================================================
--- TARGET VALIDATION
+-- TARGET SELECTION
 --==================================================
 
-local function targetIsValid(item)
-    if not item or not item.part then
-        return false
+local function chooseTarget()
+    local candidates = getCandidates()
+
+    if #candidates == 0 then
+        target = nil
+        setStatus("Searching nearby platforms...")
+        return
     end
 
-    if not item.part:IsDescendantOf(Workspace) then
-        return false
-    end
+    target = candidates[1].part
 
-    local delta = item.position - root.Position
-    local horizontal = Vector3.new(
-        delta.X, 0, delta.Z
-    ).Magnitude
-
-    return horizontal <= CONFIG.MaxHorizontalJump
-        and delta.Y <= CONFIG.MaxJumpHeight
-        and delta.Y > -8
+    setStatus(string.format(
+        "Target locked: %.0f studs",
+        candidates[1].horizontal
+    ))
 end
 
 --==================================================
 -- MOVEMENT
 --==================================================
 
-local function moveToward(item)
-    if not humanoid or not root or not item then
-        return
-    end
-
-    local delta = item.position - root.Position
-    local flat = Vector3.new(delta.X, 0, delta.Z)
-
-    if flat.Magnitude > 0.1 then
-        humanoid:Move(flat.Unit, false)
-    end
-
-    -- Face movement direction without rotating the camera.
-    if flat.Magnitude > 0.1 then
-        local desired = CFrame.lookAt(
-            root.Position,
-            root.Position + flat.Unit
-        )
-
-        root.CFrame = root.CFrame:Lerp(desired, 0.12)
-    end
-
-    -- Jump when approaching a higher platform or an edge.
-    if humanoid.FloorMaterial ~= Enum.Material.Air then
-        if item.height > 2
-            or (item.horizontal < 7 and item.height > 0.5) then
-
-            humanoid.Jump = true
-            jumpStartedAt = os.clock()
-            wasAirborne = true
-        end
-    end
-end
-
---==================================================
--- FALL RECOVERY
---==================================================
-
-local function handleFall()
-    if not root or not humanoid then
-        return
-    end
-
-    if root.Position.Y < CONFIG.FallY then
-        status.Text = "Fell! Waiting for respawn..."
+local function moveToTarget(dt)
+    if not target or not target.Parent then
         target = nil
-
         humanoid:Move(Vector3.zero, false)
         return
     end
 
-    if humanoid.Health <= 0 then
-        status.Text = "Respawning..."
+    local destination = Vector3.new(
+        target.Position.X,
+        root.Position.Y,
+        target.Position.Z
+    )
+
+    local difference = destination - root.Position
+    local flat = Vector3.new(difference.X, 0, difference.Z)
+    local distance = flat.Magnitude
+
+    if distance <= ARRIVAL_DISTANCE then
+        currentPlatform = target
         target = nil
+        humanoid:Move(Vector3.zero, false)
+        setStatus("Platform reached!")
+        return
     end
+
+    if distance > 0.1 then
+        -- Actively move the Humanoid toward the target.
+        humanoid:Move(flat.Unit, false)
+    end
+
+    -- Jump when approaching the platform or when it is elevated.
+    local targetTop = target.Position.Y + target.Size.Y / 2
+    local verticalGap = targetTop - root.Position.Y
+
+    local grounded = humanoid.FloorMaterial ~= Enum.Material.Air
+
+    if grounded and jumpCooldown <= 0 then
+        if distance <= 13 or verticalGap > 2 then
+            humanoid.Jump = true
+            jumpCooldown = 0.65
+        end
+    end
+
+    jumpCooldown = math.max(0, jumpCooldown - dt)
+
+    -- Face the direction of travel.
+    if flat.Magnitude > 0.1 then
+        local lookAt = CFrame.lookAt(
+            root.Position,
+            root.Position + flat.Unit
+        )
+
+        root.CFrame = root.CFrame:Lerp(lookAt, 0.08)
+    end
+
+    setStatus(string.format(
+        "Moving to platform: %.0f studs",
+        distance
+    ))
+end
+
+--==================================================
+-- FAILURE MEMORY
+--==================================================
+
+local lastY = 0
+local lastTargetKey
+local lastJumpTime = 0
+
+local function recordFailure()
+    if lastTargetKey then
+        memory[lastTargetKey] =
+            math.max(0, (memory[lastTargetKey] or 0.5) - 0.15)
+    end
+
+    target = nil
+    setStatus("Fall detected; searching again")
 end
 
 --==================================================
@@ -315,98 +292,69 @@ end
 button.Activated:Connect(function()
     enabled = not enabled
 
-    button.Text = enabled and "ON" or "OFF"
-    button.BackgroundColor3 = enabled
-        and Color3.fromRGB(45, 175, 105)
-        or Color3.fromRGB(170, 55, 55)
+    if enabled then
+        button.Text = "BOT: ON"
+        button.BackgroundColor3 = Color3.fromRGB(45, 160, 85)
+        setStatus("Scanning platforms...")
+        scanTimer = SCAN_RADIUS -- scan immediately
+    else
+        button.Text = "BOT: OFF"
+        button.BackgroundColor3 = Color3.fromRGB(180, 55, 55)
 
-    if not enabled and humanoid then
-        humanoid:Move(Vector3.zero, false)
-        humanoid.Jump = false
-        humanoid.AutoRotate = true
+        if humanoid then
+            humanoid:Move(Vector3.zero, false)
+        end
+
+        setStatus("Bot stopped")
     end
-
-    status.Text = enabled and "Runner starting..." or "Runner stopped"
-
-    print("[Runner] Enabled:", enabled)
 end)
 
 --==================================================
 -- MAIN LOOP
 --==================================================
 
-RunService.Heartbeat:Connect(function()
+RunService.Heartbeat:Connect(function(dt)
     if not enabled then
         return
     end
 
-    if not character or not humanoid or not root
+    if not character
+        or not character.Parent
+        or not humanoid
+        or not root
         or humanoid.Health <= 0 then
-        status.Text = "Waiting for character..."
         return
     end
 
-    handleFall()
+    scanTimer += dt
 
-    if root.Position.Y < CONFIG.FallY then
-        return
+    -- Recover after falling; normal game respawning is still required.
+    if root.Position.Y < lastY - FALL_Y_OFFSET then
+        recordFailure()
     end
 
-    local airborne =
-        humanoid.FloorMaterial == Enum.Material.Air
+    lastY = root.Position.Y
 
-    if wasAirborne and not airborne and lastTargetKey then
-        -- Landing is considered successful if we remain
-        -- alive and reach the target's vicinity.
-        local success = false
+    -- Re-scan periodically, not just once.
+    if scanTimer >= 0.25 then
+        scanTimer = 0
 
-        if target and target.part
-            and target.part:IsDescendantOf(Workspace) then
-
-            local distance = (
-                root.Position - target.position
-            ).Magnitude
-
-            success = distance < 7
+        if not target or not target.Parent then
+            chooseTarget()
         end
-
-        learn(lastTargetKey, success)
-        lastJumpOutcome = success and "Success" or "Missed"
-
-        wasAirborne = false
     end
 
-    if os.clock() - lastScan >= CONFIG.ScanInterval then
-        lastScan = os.clock()
-
-        if target and not targetIsValid(target) then
-            target = nil
-        end
-
-        if not target then
-            local options = scanPlatforms()
-            target = options[1]
-
-            if target then
-                lastTargetKey = target.key
-            end
-        end
+    -- If the current target disappears, find another one.
+    if target and not target:IsDescendantOf(Workspace) then
+        target = nil
     end
 
     if target then
-        moveToward(target)
-
-        status.Text = string.format(
-            "RUNNING\nTarget: %.1f studs\nLast jump: %s",
-            target.horizontal,
-            lastJumpOutcome
-        )
-    else
+        lastTargetKey = getPlatformKey(target)
+        moveToTarget(dt)
+    elseif humanoid.FloorMaterial ~= Enum.Material.Air then
         humanoid:Move(Vector3.zero, false)
-        status.Text = "Searching for platform..."
     end
-
-    lastPosition = root.Position
 end)
 
-print("[Runner] Loaded. Tap OFF to start.")
+print("[Adaptive Obby Runner] Loaded. Tap BOT: ON to start.")
